@@ -1,5 +1,5 @@
 // ============================================================
-// adventure.js — 무사수행 봇 (탐색형)
+// adventure.js — 무사수행 봇 (탐색형 / 구역+방향 풍경)
 // ============================================================
 import "dotenv/config";
 import { createRestAPIClient, createStreamingAPIClient } from "masto";
@@ -30,16 +30,142 @@ const streaming = createStreamingAPIClient({
   accessToken:     BOT_TOKEN,
 });
 
-// ── 탐색 세션 ─────────────────────────────────────────────────
-// { accountId -> session }
-const sessions       = new Map();
-const SESSION_TTL_MS = 30 * 60 * 1000;
+// ── 구역 정의 ─────────────────────────────────────────────────
+// steps 기준으로 구역 전환
+// monsterRate / treasureRate / safeRate 합계 = 100
 
-function cleanExpiredSessions() {
-  const now = Date.now();
-  for (const [id, s] of sessions) {
-    if (s.expiresAt < now) sessions.delete(id);
+const ZONES = [
+  {
+    label:       "입구",
+    desc:        "탐색의 시작점. 길이 비교적 잘 정비되어 있다.",
+    minStep:     1,
+    maxStep:     3,
+    monsterRate: 25,
+    treasureRate: 20,
+    treasureTier: "low",
+  },
+  {
+    label:       "외곽",
+    desc:        "사람의 흔적이 드물어진다. 풀숲이 무성하다.",
+    minStep:     4,
+    maxStep:     6,
+    monsterRate: 35,
+    treasureRate: 25,
+    treasureTier: "mid",
+  },
+  {
+    label:       "폐허",
+    desc:        "무너진 건물 잔해가 곳곳에 흩어져 있다. 불길한 기운이 느껴진다.",
+    minStep:     7,
+    maxStep:     9,
+    monsterRate: 45,
+    treasureRate: 28,
+    treasureTier: "mid",
+  },
+  {
+    label:       "심부",
+    desc:        "공기가 무겁게 가라앉아 있다. 여기까지 들어온 자는 드물다.",
+    minStep:     10,
+    maxStep:     Infinity,
+    monsterRate: 55,
+    treasureRate: 30,
+    treasureTier: "high",
+  },
+];
+
+function getZone(steps) {
+  return ZONES.find((z) => steps >= z.minStep && steps <= z.maxStep) ?? ZONES.at(-1);
+}
+
+// ── 방향별 풍경 문장 ──────────────────────────────────────────
+const SCENERY = {
+  북: [
+    "경사가 서서히 가팔라진다.",
+    "찬 바람이 정면으로 불어온다.",
+    "발 아래 돌이 많아진다.",
+    "나무가 드문드문 서 있다.",
+    "먼 곳에 산등성이가 보인다.",
+  ],
+  남: [
+    "길이 완만하게 넓어진다.",
+    "따뜻한 햇살이 등 뒤로 내리쬔다.",
+    "풀밭이 펼쳐지며 발걸음이 가벼워진다.",
+    "멀리서 물소리가 희미하게 들린다.",
+    "바람이 잦아들며 공기가 고요해진다.",
+  ],
+  동: [
+    "나무들이 점점 빽빽해진다.",
+    "새 소리가 점차 멀어진다.",
+    "이끼가 발에 밟히기 시작한다.",
+    "햇빛이 나뭇가지 사이로 비집고 든다.",
+    "좁은 샛길이 이어진다.",
+  ],
+  서: [
+    "옅은 안개가 발목을 감싼다.",
+    "낡은 돌길이 나타난다.",
+    "낡은 표지판이 보이지만 글씨를 읽을 수 없다.",
+    "습한 공기가 옷깃을 적신다.",
+    "그림자가 길게 드리운다.",
+  ],
+};
+
+function randomScenery(dir) {
+  const pool = SCENERY[dir] ?? [];
+  return pool[Math.floor(Math.random() * pool.length)] ?? "";
+}
+
+// ── 보물상자 등급 ─────────────────────────────────────────────
+const TREASURE_POOL = {
+  low: [
+    { label: "낡은 나무 상자", weight: 70, goldMin: 30,  goldMax: 100, effects: {} },
+    { label: "녹슨 철제 상자", weight: 30, goldMin: 80,  goldMax: 180, effects: { 스트레스: -1 } },
+  ],
+  mid: [
+    { label: "잠긴 가죽 상자", weight: 60, goldMin: 100, goldMax: 250, effects: { 스트레스: -2 } },
+    { label: "문양이 새겨진 상자", weight: 40, goldMin: 200, goldMax: 350, effects: { 평판: 1 } },
+  ],
+  high: [
+    { label: "황금 문양 상자",  weight: 55, goldMin: 250, goldMax: 450, effects: { 평판: 1, 스트레스: -2 } },
+    { label: "마력이 깃든 상자", weight: 45, goldMin: 350, goldMax: 600, effects: { 야망: 1, 평판: 2 } },
+  ],
+};
+
+function rollTreasure(tier) {
+  const pool = TREASURE_POOL[tier] ?? TREASURE_POOL.low;
+  const total = pool.reduce((s, t) => s + t.weight, 0);
+  let r = Math.random() * total;
+  for (const t of pool) {
+    r -= t.weight;
+    if (r <= 0) {
+      const gold = t.goldMin + Math.floor(Math.random() * (t.goldMax - t.goldMin + 1));
+      return { label: t.label, gold, effects: t.effects };
+    }
   }
+  const t = pool[0];
+  return { label: t.label, gold: t.goldMin, effects: t.effects };
+}
+
+// ── 이벤트 판정 ───────────────────────────────────────────────
+function rollEvent(zone) {
+  const r = Math.random() * 100;
+  if (r < zone.monsterRate)                          return "monster";
+  if (r < zone.monsterRate + zone.treasureRate)      return "treasure";
+  return "safe";
+}
+
+// ── 안전 내러티브 ─────────────────────────────────────────────
+const SAFE_NARRATIVES = [
+  "조용한 바람만 불어왔다.",
+  "낙엽 소리 외에는 아무것도 없었다.",
+  "멀리서 새 울음소리가 들렸다. 일단 안전하다.",
+  "수풀 사이로 햇살이 내리쬔다. 잠시 숨을 고른다.",
+  "발 아래 마른 나뭇가지가 부러졌다. 조심스럽게 나아간다.",
+  "안개가 짙어졌다가 이내 걷혔다. 길은 이어진다.",
+  "바람에 나뭇잎이 흩날렸다. 별다른 일은 없었다.",
+];
+
+function randomSafe() {
+  return SAFE_NARRATIVES[Math.floor(Math.random() * SAFE_NARRATIVES.length)];
 }
 
 // ── 몬스터 캐시 ───────────────────────────────────────────────
@@ -55,50 +181,32 @@ async function getMonsters() {
   return _monstersCache;
 }
 
-// ── 보물상자 ──────────────────────────────────────────────────
-const TREASURE_TIERS = [
-  { weight: 50, label: "낡은 상자",  goldMin: 50,  goldMax: 150, effects: {} },
-  { weight: 35, label: "잠긴 상자",  goldMin: 100, goldMax: 300, effects: { 스트레스: -2 } },
-  { weight: 15, label: "황금 상자",  goldMin: 200, goldMax: 500, effects: { 평판: 1 } },
-];
+// ── 세션 관리 ─────────────────────────────────────────────────
+const sessions       = new Map();
+const SESSION_TTL_MS = 30 * 60 * 1000;
 
-function rollTreasure() {
-  const roll = Math.random() * 100;
-  let   acc  = 0;
-  for (const tier of TREASURE_TIERS) {
-    acc += tier.weight;
-    if (roll < acc) {
-      const gold = tier.goldMin + Math.floor(Math.random() * (tier.goldMax - tier.goldMin + 1));
-      return { label: tier.label, gold, effects: tier.effects };
-    }
+function cleanExpiredSessions() {
+  const now = Date.now();
+  for (const [id, s] of sessions) {
+    if (s.expiresAt < now) sessions.delete(id);
   }
-  return { label: TREASURE_TIERS[0].label, gold: 50, effects: {} };
 }
 
-// ── 이동 방향 ─────────────────────────────────────────────────
-const DIR_TEXT = { 북: "북쪽", 남: "남쪽", 동: "동쪽", 서: "서쪽" };
-
-// ── 이벤트 확률: 35% 몬스터 / 25% 보물 / 40% 안전 ────────────
-function rollEvent() {
-  const r = Math.random() * 100;
-  if (r < 35) return "monster";
-  if (r < 60) return "treasure";
-  return "safe";
+function accumulateEffects(session, effects, goldDelta) {
+  session.totalGold += goldDelta;
+  for (const [stat, delta] of Object.entries(effects)) {
+    session.totalEffects[stat] = (session.totalEffects[stat] ?? 0) + delta;
+  }
 }
 
-// ── 안전 내러티브 ─────────────────────────────────────────────
-const SAFE_NARRATIVES = [
-  "조용한 바람만 불어왔다. 발걸음을 계속 옮긴다.",
-  "낙엽 소리 외에는 아무것도 없었다.",
-  "멀리서 새 울음소리가 들렸다. 일단 안전하다.",
-  "길이 좁아졌다가 다시 넓어졌다. 별다른 일은 없었다.",
-  "수풀 사이로 햇살이 내리쬔다. 잠시 숨을 고른다.",
-  "발 아래 마른 나뭇가지가 부러졌다. 조심스럽게 나아간다.",
-  "안개가 짙어졌다가 이내 걷혔다. 길은 이어진다.",
-];
-
-function randomSafe() {
-  return SAFE_NARRATIVES[Math.floor(Math.random() * SAFE_NARRATIVES.length)];
+function applySessionEffects(player, session) {
+  const stats  = { ...player.stats };
+  const hidden = { ...player.hidden };
+  for (const [stat, delta] of Object.entries(session.totalEffects)) {
+    if (stat in stats)  stats[stat]  = clamp(stats[stat]  + delta, 0, 100);
+    if (stat in hidden) hidden[stat] = clamp(hidden[stat] + delta, 0, 100);
+  }
+  return { ...player, stats, hidden };
 }
 
 // ── 메시지 유틸 ───────────────────────────────────────────────
@@ -141,25 +249,6 @@ async function postPublic(text) {
   });
 }
 
-// ── 세션 누적 헬퍼 ────────────────────────────────────────────
-function accumulateEffects(session, effects, goldDelta) {
-  session.totalGold += goldDelta;
-  for (const [stat, delta] of Object.entries(effects)) {
-    session.totalEffects[stat] = (session.totalEffects[stat] ?? 0) + delta;
-  }
-}
-
-// 세션 누적 효과를 임시 적용 (이동 중 성공률 계산용)
-function applySessionEffects(player, session) {
-  const stats  = { ...player.stats };
-  const hidden = { ...player.hidden };
-  for (const [stat, delta] of Object.entries(session.totalEffects)) {
-    if (stat in stats)  stats[stat]  = clamp(stats[stat]  + delta, 0, 100);
-    if (stat in hidden) hidden[stat] = clamp(hidden[stat] + delta, 0, 100);
-  }
-  return { ...player, stats, hidden };
-}
-
 // ── 탐색 시작 ─────────────────────────────────────────────────
 async function handleStart(notification, accountId, displayName, locationFilter) {
   const ok = await canDoAdventure(accountId, displayName);
@@ -176,7 +265,8 @@ async function handleStart(notification, accountId, displayName, locationFilter)
     return;
   }
 
-  const player = await getPlayer(accountId, displayName);
+  const player    = await getPlayer(accountId, displayName);
+  const startZone = ZONES[0];
 
   sessions.set(accountId, {
     displayName,
@@ -192,18 +282,20 @@ async function handleStart(notification, accountId, displayName, locationFilter)
   const lines = [
     `[${displayName}] 무사수행 시작 — ${locationFilter ?? "야외"}`,
     "",
-    "탐색을 시작합니다. 방향을 선택해 이동하세요.",
-    "",
-    "[북] [남] [동] [서] — 이동",
-    "[귀환] — 탐색 종료 및 결과 저장",
+    `현재 구역: ${startZone.label}`,
+    startZone.desc,
     "",
     `출발 전 상태 / 체력: ${player.stats.체력} / 전투: ${player.hidden.전투} / 소지금: ${player.gold}G`,
+    "",
+    "[북] [남] [동] [서] 이동 / [귀환] 탐색 종료",
   ];
 
   await replyDM(notification, lines.join("\n"));
 }
 
 // ── 이동 처리 ─────────────────────────────────────────────────
+const DIR_TEXT = { 북: "북쪽", 남: "남쪽", 동: "동쪽", 서: "서쪽" };
+
 async function handleMove(notification, accountId, dir) {
   cleanExpiredSessions();
 
@@ -216,12 +308,28 @@ async function handleMove(notification, accountId, dir) {
   session.steps    += 1;
   session.expiresAt = Date.now() + SESSION_TTL_MS;
 
+  const zone      = getZone(session.steps);
+  const prevZone  = getZone(session.steps - 1);
+  const zoneChanged = zone.label !== prevZone.label;
+
   const player    = session.playerSnapshot;
   const monsters  = await getMonsters();
   const age       = getAge(player.turn);
-  const eventType = rollEvent();
+  const eventType = rollEvent(zone);
 
-  const lines = [`[${session.steps}번째 이동 — ${DIR_TEXT[dir]}]`, ""];
+  const lines = [
+    `[${DIR_TEXT[dir]} / ${session.steps}번째 이동]`,
+    randomScenery(dir),
+  ];
+
+  // 구역 전환 알림
+  if (zoneChanged) {
+    lines.push("");
+    lines.push(`--- 구역 전환: ${zone.label} ---`);
+    lines.push(zone.desc);
+  }
+
+  lines.push("");
 
   if (eventType === "monster") {
     const pool = Object.values(monsters).filter((m) => {
@@ -253,12 +361,10 @@ async function handleMove(notification, accountId, dir) {
       ...Object.entries(outcome.effects).map(([s, d]) => `${s}${d > 0 ? "+" : ""}${d}`),
       goldDelta !== 0 ? `골드${goldDelta > 0 ? "+" : ""}${goldDelta}G` : null,
     ].filter(Boolean);
-
     if (fxParts.length > 0) lines.push(`변화: ${fxParts.join(" / ")}`);
 
     session.log.push({ type: "monster", name: monsterName, result, goldDelta });
 
-    // 체력 위험 체크 — 강제 귀환
     const tempAfter = applySessionEffects(player, session);
     if (tempAfter.stats.체력 <= 5) {
       lines.push("");
@@ -269,11 +375,10 @@ async function handleMove(notification, accountId, dir) {
     }
 
   } else if (eventType === "treasure") {
-    const chest = rollTreasure();
+    const chest = rollTreasure(zone.treasureTier);
     accumulateEffects(session, chest.effects, chest.gold);
 
     lines.push(`보물 발견: ${chest.label}`);
-    lines.push("");
     lines.push(`골드 +${chest.gold}G 획득`);
 
     if (Object.keys(chest.effects).length > 0) {
@@ -289,7 +394,7 @@ async function handleMove(notification, accountId, dir) {
   }
 
   lines.push("");
-  lines.push(`누적 골드: +${session.totalGold}G / 이동 횟수: ${session.steps}`);
+  lines.push(`현재 구역: ${zone.label} / 이동 ${session.steps}회 / 누적 골드 +${session.totalGold}G`);
   lines.push("[북] [남] [동] [서] 이동 / [귀환] 복귀");
 
   await replyDM(notification, lines.join("\n"));
@@ -332,6 +437,7 @@ async function finishAdventure(notification, accountId, forced) {
 
   const monsterCount  = session.log.filter((e) => e.type === "monster").length;
   const treasureCount = session.log.filter((e) => e.type === "treasure").length;
+  const finalZone     = getZone(session.steps);
 
   const fxLines = Object.entries(session.totalEffects)
     .map(([s, d]) => `${s}${d > 0 ? "+" : ""}${d}`)
@@ -339,7 +445,7 @@ async function finishAdventure(notification, accountId, forced) {
 
   const publicText = [
     `[${session.displayName}] 무사수행 귀환${forced ? " (강제)" : ""}`,
-    `탐색 지역: ${session.location} / 이동 횟수: ${session.steps}`,
+    `탐색 지역: ${session.location} / 최종 구역: ${finalZone.label} / 이동 ${session.steps}회`,
     `조우: 마물 ${monsterCount}회 / 보물 ${treasureCount}회`,
     "",
     `총 획득 골드: +${session.totalGold}G`,
@@ -355,7 +461,7 @@ async function finishAdventure(notification, accountId, forced) {
 
   await logAdventure(
     session.displayName,
-    `${session.location} (${session.steps}회 탐색)`,
+    `${session.location} / ${finalZone.label} (${session.steps}회)`,
     forced ? "강제귀환" : "귀환",
     session.steps,
     monsterCount,
