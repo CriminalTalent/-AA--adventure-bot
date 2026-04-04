@@ -3,9 +3,17 @@
 // ============================================================
 import "dotenv/config";
 import { createRestAPIClient, createStreamingAPIClient } from "masto";
-import { PUBLIC_STATS, HIDDEN_STATS, buildStatusLine }   from "./game.js";
-import { getPlayer, canDoAdventure, processPlayer }      from "./storage.js";
-import { loadMonsters, logAdventure }                    from "./sheets.js";
+import {
+  calcSuccessRate,
+  rollAdventure,
+  ADVENTURE_OUTCOMES,
+  calcAdventureGold,
+  applyEffects,
+  buildAdventureResult,
+  getAge,
+} from "./game.js";
+import { getPlayer, canDoAdventure, processPlayer } from "./storage.js";
+import { loadMonsters, logAdventure }               from "./sheets.js";
 
 const BOT_TOKEN    = process.env.ADVENTURE_TOKEN;
 const INSTANCE_URL = process.env.MASTODON_URL;
@@ -33,97 +41,6 @@ async function getMonsters() {
   _monstersCache    = await loadMonsters();
   _monstersCachedAt = now;
   return _monstersCache;
-}
-
-// ── 결과 단계 정의 ────────────────────────────────────────────
-// 성공률 기준:
-//   대성공: roll <= successRate * 0.15
-//   성공:   roll <= successRate
-//   실패:   roll <= 95
-//   대실패: roll > 95
-
-const OUTCOMES = {
-  대성공: {
-    narrative: (monster) => [
-      `${monster ? monster.dialogue ?? monster.마물명 : "적"}과 맞닥뜨렸다.`,
-      "눈 깜짝할 사이에 승부가 갈렸다. 완벽한 승리였다.",
-    ],
-    effects: { 전투: 4, 스트레스: -3, 평판: 3, 야망: 1 },
-    goldBase: (monster) => monster
-      ? Math.floor((monster.goldMin + monster.goldMax) / 2 * 1.5)
-      : 250,
-  },
-  성공: {
-    narrative: (monster) => [
-      `${monster ? monster.dialogue ?? monster.마물명 : "적"}과 교전했다.`,
-      "쉽지 않은 싸움이었지만 결국 물리쳤다.",
-    ],
-    effects: { 전투: 2, 스트레스: 2, 평판: 1 },
-    goldBase: (monster) => monster
-      ? Math.floor(monster.goldMin + (monster.goldMax - monster.goldMin) * Math.random())
-      : 100,
-  },
-  실패: {
-    narrative: (monster) => [
-      `${monster ? monster.dialogue ?? monster.마물명 : "적"}에게 밀렸다.`,
-      "간신히 목숨만 건져 돌아왔다.",
-    ],
-    effects: { 체력: -4, 스트레스: 4, 위험도: 2 },
-    goldBase: () => 0,
-  },
-  대실패: {
-    narrative: (monster) => [
-      `${monster ? monster.dialogue ?? monster.마물명 : "적"}에게 크게 당했다.`,
-      "의식을 잃었다가 겨우 정신을 차렸다. 소지품 일부를 잃었다.",
-    ],
-    effects: { 체력: -7, 스트레스: 7, 위험도: 4 },
-    goldBase: () => -50,
-  },
-};
-
-// ── 성공률 계산 ───────────────────────────────────────────────
-// 기본값: 체력 * 0.2 + 전투 * 0.5 + 30
-// 몬스터 방어력이 있으면 차감
-// 하한 10 / 상한 85
-
-function calcSuccessRate(player, monster) {
-  const base    = 30 + Math.floor(player.stats.체력 * 0.2 + player.hidden.전투 * 0.5);
-  const penalty = monster ? Math.floor(monster.def * 0.3) : 0;
-  return Math.min(85, Math.max(10, base - penalty));
-}
-
-// ── d100 판정 ─────────────────────────────────────────────────
-
-function rollOutcome(successRate) {
-  const roll      = Math.floor(Math.random() * 100) + 1;
-  const critZone  = Math.floor(successRate * 0.15);
-
-  let result;
-  if      (roll <= critZone)    result = "대성공";
-  else if (roll <= successRate) result = "성공";
-  else if (roll <= 95)          result = "실패";
-  else                          result = "대실패";
-
-  return { roll, result };
-}
-
-// ── 수치 적용 ─────────────────────────────────────────────────
-
-function clamp(v, min = 0, max = 100) {
-  return Math.min(max, Math.max(min, v));
-}
-
-function applyEffects(player, effects, goldDelta) {
-  const stats  = { ...player.stats };
-  const hidden = { ...player.hidden };
-  let   gold   = player.gold + goldDelta;
-
-  for (const [stat, delta] of Object.entries(effects)) {
-    if (PUBLIC_STATS.includes(stat))      stats[stat]  = clamp(stats[stat]  + delta, 0, 100);
-    else if (HIDDEN_STATS.includes(stat)) hidden[stat] = clamp(hidden[stat] + delta, 0, 100);
-  }
-
-  return { stats, hidden, gold };
 }
 
 // ── 메시지 유틸 ───────────────────────────────────────────────
@@ -182,9 +99,7 @@ async function handleAdventure(notification, accountId, displayName, monsterName
 
   const player   = await getPlayer(accountId, displayName);
   const monsters = await getMonsters();
-  const age      = player.turn <= 8  ? 8 + Math.floor((player.turn - 1) / 2)
-                 : player.turn <= 16 ? 12 + Math.floor((player.turn - 9) / 2)
-                 : 16 + Math.floor((player.turn - 17) / 2);
+  const age      = getAge(player.turn);
 
   // 몬스터 결정
   let monster = null;
@@ -194,26 +109,26 @@ async function handleAdventure(notification, accountId, displayName, monsterName
       await replyDM(notification, `'${monsterName}'은(는) 등록되지 않은 마물입니다.`);
       return;
     }
-    if (age < monster.minAge) {
+    if (age < (monster.minAge ?? 0)) {
       await replyDM(notification, `'${monsterName}'은(는) ${monster.minAge}세 이상만 도전할 수 있습니다.`);
       return;
     }
   } else {
     // 나이에 맞는 몬스터 중 랜덤 선택
-    const pool = Object.values(monsters).filter((m) => m.minAge <= age);
+    const pool = Object.values(monsters).filter((m) => (m.minAge ?? 0) <= age);
     if (pool.length > 0) {
       monster = pool[Math.floor(Math.random() * pool.length)];
     }
   }
 
   // 판정
-  const successRate        = calcSuccessRate(player, monster);
-  const { roll, result }   = rollOutcome(successRate);
-  const outcome            = OUTCOMES[result];
-  const goldDelta          = outcome.goldBase(monster);
+  const successRate          = calcSuccessRate(player, monster);
+  const { roll, result }     = rollAdventure(successRate);
+  const goldDelta            = calcAdventureGold(result, monster);
+  const outcome              = ADVENTURE_OUTCOMES[result];
   const { stats, hidden, gold } = applyEffects(player, outcome.effects, goldDelta);
 
-  // 플레이어 저장 + 무사수행 결과 history에 기록
+  // 플레이어 저장 + history에 무사수행 결과 기록
   const updated = await processPlayer(accountId, (p) => {
     const history = [...p.history];
     if (history.length > 0) {
@@ -231,26 +146,11 @@ async function handleAdventure(notification, accountId, displayName, monsterName
     return { ...p, stats, hidden, gold, history };
   });
 
-  // 효과 텍스트
-  const effectLines = [
-    ...Object.entries(outcome.effects).map(([s, d]) => `${s}${d > 0 ? "+" : ""}${d}`),
-    goldDelta !== 0 ? `골드${goldDelta > 0 ? "+" : ""}${goldDelta}G` : null,
-  ].filter(Boolean).join(", ");
-
   // 공개 게시
-  const publicLines = [
-    `[${player.name}] 무사수행 — ${result}`,
-    `주사위: ${roll} / 성공률: ${successRate}%`,
-    monster ? `상대: ${monster.마물명} (${monster.location ?? ""})` : "",
-    "",
-    ...outcome.narrative(monster),
-    "",
-    `변화: ${effectLines}`,
-    "",
-    buildStatusLine(updated),
-  ].filter((l) => l !== undefined);
-
-  await postPublic(publicLines.join("\n"));
+  const publicText = buildAdventureResult(
+    player, updated, monster, result, roll, successRate, goldDelta
+  );
+  await postPublic(publicText);
   await replyDM(notification, `무사수행 완료 (${result}). 결과가 공개 게시되었습니다.`);
 
   // 시트 기록
@@ -280,11 +180,16 @@ async function handleMonsterList(notification, location) {
     return;
   }
 
-  const lines = entries.map(([name, m]) =>
-    `${name} [${m.location ?? "-"}] — HP:${m.hp} 공격:${m.atk} 방어:${m.def} / 골드:${m.goldMin}~${m.goldMax}G / ${m.desc ?? ""}`
-  );
+  const lines = entries.map(([name, m]) => {
+    const goldRange = `${m.goldMin ?? 0}~${m.goldMax ?? 0}G`;
+    const loc       = m.location ?? "-";
+    const desc      = m.desc     ?? "";
+    return `${name} [${loc}] — HP:${m.hp} 공격:${m.atk} 방어:${m.def} / 골드:${goldRange} / ${desc}`;
+  });
 
-  await replyDM(notification, `[마물 목록${location ? ` — ${location}` : ""}]\n${lines.join("\n")}`);
+  await replyDM(notification,
+    `[마물 목록${location ? ` — ${location}` : ""}]\n${lines.join("\n")}`
+  );
 }
 
 // ── 명령 분기 ─────────────────────────────────────────────────
@@ -309,7 +214,9 @@ async function handleNotification(notification) {
         await handleMonsterList(notification, token.value);
         break;
       default:
-        await replyDM(notification, "알 수 없는 명령입니다. [무사수행] 또는 [몬스터목록]을 입력해주세요.");
+        await replyDM(notification,
+          "알 수 없는 명령입니다.\n[무사수행] 또는 [몬스터목록]을 입력해주세요."
+        );
         break;
     }
   }
